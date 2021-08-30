@@ -8,9 +8,9 @@ Useful WebGPU resources:
 - [In-depth tutorial](https://sotrh.github.io/learn-wgpu)
 
 
-### Features
+## Features
 ---
-#### Shader Linking
+### Shader Linking
 
 The linker aims to provide Rust-like module support and straightforward compilation for WGSL shaders. In other words, no more thousand-line shader file/modules full of duplicated code. 
 
@@ -153,7 +153,7 @@ This would generate the same module as the original example.
 
 ---
 
-#### Data Consolidation
+### Data Consolidation
 
 Currently, all data which is to be buffered from cpu to gpu must be described by developers multiple times. The first is in the shader itself. Above, both `ObjectUniforms` and `VertexInput` are input data structs. After defining them in the shader, you have to redefine them in Rust:
 
