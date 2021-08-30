@@ -9,7 +9,7 @@ Useful WebGPU resources:
 
 
 ## Features
----
+
 ### Shader Linking
 
 The linker aims to provide Rust-like module support and straightforward compilation for WGSL shaders. In other words, no more thousand-line shader file/modules full of duplicated code. 
@@ -151,7 +151,6 @@ pub struct ObjectUniforms {
 
 This would generate the same module as the original example.
 
----
 
 ### Data Consolidation
 
