@@ -149,6 +149,8 @@ pub struct ObjectUniforms {
 };
 ```
 
+This would generate the same module as the original example.
+
 ---
 
 #### Data Consolidation
@@ -194,20 +196,11 @@ let vertex_input_layout = wgpu::VertexBufferLayout {
 
 To make this a better experience, `wgsl-rs` can eliminate all redefinition by generating vertex attribute structs, uniform structs, and vertex buffer layouts from your shader code.
 
+Generating structs for uniforms is as simple as invoking a "macro". We can do so for the object uniforms in`object.rsl`:
 ```rust
-// shader.rs
-
-[[block]]
-struct ObjectUniforms {
+#[uniform]
+pub struct ObjectUniforms {
     model_matrix: mat4x4<f32>;
-};
-
-[[group(0), binding(0)]]
-var<uniform> object: ObjectUniforms;
-
-struct VertexInput {
-    [[location(0)]] position: vec3<f32>;
-    [[location(1)]] uvs: vec2<f32>;
 };
 ```
 
