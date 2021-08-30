@@ -1,15 +1,216 @@
 # wgsl-rs
 
-A linker for WGSL (WebGPU Shading Language) shaders. This crate aims to provide Rust-like module support and straightforward compilation for WGSL shaders. In other words, no more thousand-line shader files full of duplicated code. 
+Utilities for WGSL (WebGPU Shading Language) shaders. 
 
 Useful WebGPU resources:
 - [Official spec](https://gpuweb.github.io/gpuweb/)
 - [Rust implementation](https://github.com/gfx-rs/wgpu) 
 - [In-depth tutorial](https://sotrh.github.io/learn-wgpu)
 
-### Usage
+
+### Features
+---
+#### Shader Linking
+
+The linker aims to provide Rust-like module support and straightforward compilation for WGSL shaders. In other words, no more thousand-line shader file/modules full of duplicated code. 
+
+Typically, one writes their shader module in one `.wgsl` file, which might look like this:
+
+```rust
+[[block]]
+struct ObjectUniforms {
+    model_matrix: mat4x4<f32>;
+};
+
+[[group(0), binding(0)]]
+var<uniform> object: ObjectUniforms;
+
+// Vertex shader
+
+struct VertexInput {
+    [[location(0)]] position: vec3<f32>;
+    [[location(1)]] uvs: vec2<f32>;
+};
+
+struct VertexOutput {
+    [[builtin(position)]] clip_position: vec4<f32>;
+    [[location(0)]] uvs: vec2<f32>;
+};
+
+[[stage(vertex)]]
+fn main(
+    vert: VertexInput,
+) -> VertexOutput {
+    var out: VertexOutput;
+    out.uvs = vert.uvs;
+    out.clip_position = object.model_matrix * vec4<f32>(vert.position, 1.0);
+    return out;
+}
+
+// Fragment shader
+
+[[group(1), binding(0)]]
+var diffuse_t: texture_2d<f32>;
+[[group(1), binding(1)]]
+var diffuse_s: sampler;
+
+[[stage(fragment)]]
+fn main(frag: VertexOutput) -> [[location(0)]] vec4<f32> {
+    return textureSample(diffuse_t, diffuse_s, frag.uvs);
+}
+```
+
+The module is then compiled with a `wgpu::Device` like so:
+
+```rust
+let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+    label: Some("example_shader"),
+    flags: wgpu::ShaderFlags::all(),
+    source: wgpu::ShaderSource::Wgsl(include_str!("example.wgsl").into()),
+});
+```
+
+`wgsl-rs` allows you to separate your shaders into multiple files, and compose modules via `pub` and `use` syntax. For formatting/highlighting purposes, a new file type is used: `.rsl` (rust shader language). All your shader files live under one `rsl/` directory anywhere in your crate. The following directory structure is enforced:
+
+```
+rsl/
+|  modules/
+|  |  <module 1>/
+|  |  | vert.rsl
+|  |  | frag.rsl
+|  |  <module 2>/
+|  |  | vert.rsl
+|  |  | frag.rsl
+|  common/
+|  |  <common file 1>.rsl 
+|  |  <common file 2>.rsl 
+```
+
+Modules can import from common files, and vert/frag files within a module can import from each other. There are no "common modules", because shaders shouldn't be that big. The example shader given above is tiny, but we'll use it to demonstrate the linker by separating `example.wgsl` into its vertex and fragment components, and moving the object uniforms into a common file. The file tree would look like this:
+
+```
+rsl/
+|  modules/
+|  |  example/
+|  |  | vert.rsl
+|  |  | frag.rsl
+|  common/
+|  |  object.rsl 
+```
+
+And the files:
+
+`vert.rsl`
+```rust
+use object::ObjectUniforms;
+
+struct VertexInput {
+    [[location(0)]] position: vec3<f32>;
+    [[location(1)]] uvs: vec2<f32>;
+};
+
+pub struct VertexOutput {
+    [[builtin(position)]] clip_position: vec4<f32>;
+    [[location(0)]] uvs: vec2<f32>;
+};
+
+[[group(0), binding(0)]]
+var<uniform> object: ObjectUniforms;
+
+fn main(
+    vert: VertexInput,
+) -> VertexOutput {
+    var out: VertexOutput;
+    out.uvs = vert.uvs;
+    out.clip_position = object.model_matrix * vec4<f32>(vert.position, 1.0);
+    return out;
+}
+```
+
+`frag.rsl`
+```rust
+use vert::VertexOutput;
+
+[[group(1), binding(0)]]
+var diffuse_t: texture_2d<f32>;
+[[group(1), binding(1)]]
+var diffuse_s: sampler;
+
+[[stage(fragment)]]
+fn main(frag: VertexOutput) -> [[location(0)]] vec4<f32> {
+    return textureSample(diffuse_t, diffuse_s, frag.uvs);
+}
+```
+
+`object.rsl`
+```rust
+pub struct ObjectUniforms {
+    model_matrix: mat4x4<f32>;
+};
+```
 
 ---
+
+#### Data Consolidation
+
+Currently, all data which is to be buffered from cpu to gpu must be described by developers multiple times. The first is in the shader itself. Above, both `ObjectUniforms` and `VertexInput` are input data structs. After defining them in the shader, you have to redefine them in Rust:
+
+```rust
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ObjectUniforms {
+    model_matrix: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct VertexInput {
+    position: [f32; 3],
+    uvs: [f32; 2],
+}
+```
+
+Then, you "define" the vertex attribute structs a third time, to use in your render pipeline:
+
+
+```rust
+let vertex_input_layout = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+    step_mode: wgpu::InputStepMode::Vertex,
+    attributes: &[
+        wgpu::VertexAttribute {
+            offset: 0,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Float32x3,
+        },
+        wgpu::VertexAttribute {
+            offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Float32x3,
+        }
+    ]
+};
+```
+
+To make this a better experience, `wgsl-rs` can eliminate all redefinition by generating vertex attribute structs, uniform structs, and vertex buffer layouts from your shader code.
+
+```rust
+// shader.rs
+
+[[block]]
+struct ObjectUniforms {
+    model_matrix: mat4x4<f32>;
+};
+
+[[group(0), binding(0)]]
+var<uniform> object: ObjectUniforms;
+
+struct VertexInput {
+    [[location(0)]] position: vec3<f32>;
+    [[location(1)]] uvs: vec2<f32>;
+};
+```
+
 <!--
 ## Intro to GPUs
 The next few sections form a short introduction to modern gpu programming standards/architecture/hardware. It is targeted towards graphics programmers who are new to `wgpu` but have used other graphics APIs before. However, it is also written to be comprehendible by the average non-graphics programmer, so feel free to skip ahead if this is below you. The wgpu-specific section starts [here](#what-is-wgpu).
