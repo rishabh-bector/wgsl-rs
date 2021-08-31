@@ -12,7 +12,9 @@ Useful WebGPU resources:
 
 ### Shader Linking
 
-The linker aims to provide Rust-like module support and straightforward compilation for WGSL shaders. In other words, no more thousand-line shader file/modules full of duplicated code. 
+`wgsl-rs` allows you to separate your shaders into multiple files, and compose modules via Rust-like `pub` and `use` declarations. In other words, no more thousand-line shader file/modules full of duplicated code. 
+
+##### Life before `wgsl-rs`
 
 Typically, one writes their shader module in one `.wgsl` file, which might look like this:
 
@@ -60,17 +62,18 @@ fn main(frag: VertexOutput) -> [[location(0)]] vec4<f32> {
 }
 ```
 
-The module is then compiled with a `wgpu::Device` like so:
+The shader module is then compiled from its source using a `wgpu::Device`:
 
 ```rust
-let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+let module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
     label: Some("example_shader"),
     flags: wgpu::ShaderFlags::all(),
     source: wgpu::ShaderSource::Wgsl(include_str!("example.wgsl").into()),
 });
 ```
+##### The `wgsl-rs` Experience
 
-`wgsl-rs` allows you to separate your shaders into multiple files, and compose modules via `pub` and `use` syntax. For formatting/highlighting purposes, a new file type is used: `.rsl` (rust shader language). All your shader files live under one `rsl/` directory anywhere in your crate. The following directory structure is enforced:
+For formatting/highlighting purposes, a new file type is used: `.rsl` (rust shader language). All your shader files live under one `rsl/` directory anywhere in your crate. The following directory structure is enforced:
 
 ```
 rsl/
@@ -86,7 +89,7 @@ rsl/
 |  |  <common file 2>.rsl 
 ```
 
-Modules can import from common files, and vert/frag files within a module can import from each other. There are no "common modules", because shaders shouldn't be that big. The example shader given above is tiny, but we'll use it to demonstrate the linker by separating `example.wgsl` into its vertex and fragment components, and moving the object uniforms into a common file. The file tree would look like this:
+Modules can import from common files, and vertex/fragment stages within a module can import from each other. There are no "common modules", because shaders shouldn't be that big. The example shader given above is tiny, but we'll use it to demonstrate the linker by separating `example.wgsl` into its vertex and fragment components, and moving the object uniforms into a common file. The file tree would look like this:
 
 ```
 rsl/
@@ -149,7 +152,11 @@ pub struct ObjectUniforms {
 };
 ```
 
-This would generate the same module as the original example.
+Now, you can generate the same module as the original example via a macro:
+```rust
+#[shader]
+pub const RSL: &'static str = "src/rsl";
+```
 
 
 ### Data Consolidation
@@ -195,11 +202,20 @@ let vertex_input_layout = wgpu::VertexBufferLayout {
 
 To make this a better experience, `wgsl-rs` can eliminate all redefinition by generating vertex attribute structs, uniform structs, and vertex buffer layouts from your shader code.
 
-Generating structs for uniforms is as simple as invoking a "macro". We can do so for the object uniforms in`object.rsl`:
+Generating structs for uniforms and vertex inputs is as simple as decorating your shader code with macros. We can do so for the object uniforms in`object.rsl`:
 ```rust
 #[uniform]
 pub struct ObjectUniforms {
     model_matrix: mat4x4<f32>;
+};
+```
+
+And for the vertex input in `vert.rsl`:
+```rust
+#[vertex]
+struct VertexInput {
+    [[location(0)]] position: vec3<f32>;
+    [[location(1)]] uvs: vec2<f32>;
 };
 ```
 
