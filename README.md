@@ -154,8 +154,10 @@ pub struct ObjectUniforms {
 
 Now, you can generate the same module as the original example via a macro:
 ```rust
-#[shader]
-pub const RSL: &'static str = "src/rsl";
+#[shaders(src/rsl)]
+pub enum Shaders {
+    Example,
+}
 ```
 
 
