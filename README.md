@@ -153,10 +153,17 @@ pub struct ObjectUniforms {
 ```
 
 Now, you can generate the same module as the original example via a macro:
+`main.rs`
 ```rust
 #[shaders(src/rsl)]
 pub enum Shaders {
     Example,
+}
+
+fn main() {
+    // .. create window, wgpu surface/adapter/device, etc.
+
+    Shaders::compile(&device);
 }
 ```
 
