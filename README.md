@@ -152,7 +152,8 @@ pub struct ObjectUniforms {
 };
 ```
 
-Now, you can generate the same module as the original example via a macro:
+Now, you can generate the same module as the original example via a macro in your Rust code:
+
 `main.rs`
 ```rust
 #[shaders(src/rsl)]
