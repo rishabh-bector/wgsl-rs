@@ -152,7 +152,7 @@ pub struct ObjectUniforms {
 };
 ```
 
-Now, you can generate the same module as the original example via a macro in your Rust code:
+Now, you can generate the same `wgpu::ShaderModule` as the original example via a macro in your Rust code:
 
 `main.rs`
 ```rust
