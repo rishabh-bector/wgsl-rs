@@ -6,8 +6,19 @@ use quote::quote;
 use std::{collections::HashMap, env, fs, path::PathBuf};
 use syn;
 
+mod rsl;
+
 #[proc_macro_attribute]
 pub fn shaders(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let out = rsl::test();
+    return quote!(
+        pub fn test_macro() {
+            let out = #out;
+            println!("{}", out);
+        }
+    )
+    .into();
+
     let ast: syn::DeriveInput = syn::parse(item).unwrap();
 
     let mod_enum = match ast.data {
@@ -23,19 +34,19 @@ pub fn shaders(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
     let dbg = format!("{:?}", mod_names);
 
-    let mut rsl_path = attr.to_string();
+    let mut rsl_path = attr.to_string().replace("\"", "");
     rsl_path.retain(|c| !c.is_whitespace());
 
     let rsl = read_rsl(&rsl_path, mod_names).unwrap();
     quote!(
         pub fn test_macro() {
-            println!(#dbg);
+            parser::test();
         }
     )
     .into()
 }
 
-struct RSL {
+struct SourceTree {
     modules: HashMap<String, ShaderModule>,
     common: HashMap<String, ShaderCommon>,
 }
@@ -47,7 +58,7 @@ struct ShaderModule {
 
 struct ShaderCommon(String);
 
-fn read_rsl(path: &str, module_names: Vec<String>) -> Result<RSL> {
+fn read_rsl(path: &str, module_names: Vec<String>) -> Result<SourceTree> {
     let wd = env::current_dir().expect(&format!("unable to read working directory"));
     let rsl_path = wd.join(path);
     let dir = fs::read_dir(rsl_path.clone()).expect(&format!(
@@ -99,5 +110,5 @@ fn read_rsl(path: &str, module_names: Vec<String>) -> Result<RSL> {
         })
         .collect();
 
-    Ok(RSL { modules, common })
+    Ok(SourceTree { modules, common })
 }

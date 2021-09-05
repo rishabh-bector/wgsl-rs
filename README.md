@@ -1,33 +1,38 @@
-# wgsl-rs
+# RSL: Rust Shader Language
 
-Utilities for WGSL (WebGPU Shading Language) shaders. 
+RSL is a shader language designed as an alternative to WGSL. It is intended for use with [wgpu-rs](https://github.com/gfx-rs/wgpu), an excellent implementation of the [WebGPU](https://gpuweb.github.io/gpuweb/) graphics API in Rust. The `wgpu` crate has become the standard for graphics developers using Rust. RSL is built on top of WGPU; it's intended to make WGSL more fun. If it's more efficient/reliable, that was an accident. But you never know...
+
+Features:
+- [Shader linking](#shader-linking): separate your shaders into organized modules and directories via `pub` and `use` syntax.
+- [Data Consolidation](#data-consolidation): generate vertex attribute structs, uniform structs and vertex buffer layouts in Rust, at compile time, from your shader code.
+- [Opinionated Syntax](#opinionated-syntax): RSL features a more complete Rust-like syntax than WGSL. See the linked section for the reasoning behind RSL.
+- [Boilerplate](#boilerplate): Add boilerplate generation features as added.
+
+Possible other features of RSL:
+- enums in WGSL
+- impls in WGSL
+- no need for functions to be defined in a certain order
 
 Useful WebGPU resources:
 - [Official spec](https://gpuweb.github.io/gpuweb/)
-- [Rust implementation](https://github.com/gfx-rs/wgpu) 
 - [In-depth tutorial](https://sotrh.github.io/learn-wgpu)
 
 
-## Features
-
+## Overview
+---
 ### Shader Linking
 
 `wgsl-rs` allows you to separate your shaders into multiple files, and compose modules via Rust-like `pub` and `use` declarations. In other words, no more thousand-line shader file/modules full of duplicated code. 
 
-##### Life before `wgsl-rs`
+#### Life before `wgsl-rs`
 
 Typically, one writes their shader module in one `.wgsl` file, which might look like this:
 
 ```rust
 [[block]]
-struct ObjectUniforms {
-    model_matrix: mat4x4<f32>;
+struct Camera {
+    view_proj: mat4x4<f32>;
 };
-
-[[group(0), binding(0)]]
-var<uniform> object: ObjectUniforms;
-
-// Vertex shader
 
 struct VertexInput {
     [[location(0)]] position: vec3<f32>;
@@ -35,30 +40,43 @@ struct VertexInput {
 };
 
 struct VertexOutput {
-    [[builtin(position)]] clip_position: vec4<f32>;
     [[location(0)]] uvs: vec2<f32>;
+    [[builtin(position)]] position: vec4<f32>;
 };
+
+struct Bruh {
+    hello: vec2<f32>;
+    lmao: i32;
+};
+
+// Vertex shader
+
+[[group(0), binding(0)]]
+var<uniform> camera: Camera;
 
 [[stage(vertex)]]
 fn main(
-    vert: VertexInput,
+    model: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.uvs = vert.uvs;
-    out.clip_position = object.model_matrix * vec4<f32>(vert.position, 1.0);
+    out.uvs = model.uvs;
+    out.position = camera.view_proj * vec4<f32>(model.position, 1.0);
+
+    var x: Bruh = Bruh(vec2<f32>(1.0, 2.0), 1);
+
     return out;
 }
 
 // Fragment shader
 
 [[group(1), binding(0)]]
-var diffuse_t: texture_2d<f32>;
+var t_diffuse: texture_2d<f32>;
 [[group(1), binding(1)]]
-var diffuse_s: sampler;
+var s_diffuse: sampler;
 
 [[stage(fragment)]]
-fn main(frag: VertexOutput) -> [[location(0)]] vec4<f32> {
-    return textureSample(diffuse_t, diffuse_s, frag.uvs);
+fn main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
+    return textureSample(t_diffuse, s_diffuse, in.uvs);
 }
 ```
 
@@ -71,7 +89,7 @@ let module = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
     source: wgpu::ShaderSource::Wgsl(include_str!("example.wgsl").into()),
 });
 ```
-##### The `wgsl-rs` Experience
+#### The `wgsl-rs` Experience
 
 For formatting/highlighting purposes, a new file type is used: `.rsl` (rust shader language). All your shader files live under one `rsl/` directory anywhere in your crate. The following directory structure is enforced:
 
@@ -89,7 +107,11 @@ rsl/
 |  |  <common file 2>.rsl 
 ```
 
-Modules can import from common files, and vertex/fragment stages within a module can import from each other. There are no "common modules", because shaders shouldn't be that big. The example shader given above is tiny, but we'll use it to demonstrate the linker by separating `example.wgsl` into its vertex and fragment components, and moving the object uniforms into a common file. The file tree would look like this:
+Modules consist of a vert/frag shader pair, which can be compiled into a WGSL module; other types of shaders are not yet supported. Modules can `use` from common files, and vertex/fragment stages within a module can `use` from each other. There are no "common modules" or common directories because shader modules should not be too large. Common files can `use` from each other as long as cyclical dependencies are avoided.
+
+# WRITE A FULL SYNTAX TUTORIAL, THIS IS NOT ENOUGH
+
+The example shader given above is tiny, but it's enough to demonstrate RSL.  `example.wgsl` as RSL.., and moving the object uniforms into a common file. The file tree would look like this:
 
 ```
 rsl/
@@ -105,27 +127,29 @@ And the files:
 
 `vert.rsl`
 ```rust
-use object::ObjectUniforms;
+use camera::CameraData;
 
+#[vertex]
 struct VertexInput {
-    [[location(0)]] position: vec3<f32>;
-    [[location(1)]] uvs: vec2<f32>;
-};
+    position: Vec3,
+    uvs: Vec2,
+}
 
+#[transport]
 pub struct VertexOutput {
-    [[builtin(position)]] clip_position: vec4<f32>;
-    [[location(0)]] uvs: vec2<f32>;
-};
-
-[[group(0), binding(0)]]
-var<uniform> object: ObjectUniforms;
+    #[position]: Vec4,
+    uvs: Vec2,
+}
 
 fn main(
     vert: VertexInput,
+    #[uniform] camera: CameraData,
 ) -> VertexOutput {
-    var out: VertexOutput;
-    out.uvs = vert.uvs;
-    out.clip_position = object.model_matrix * vec4<f32>(vert.position, 1.0);
+    let out: VertexOutput::new(
+        camera.view_proj * vec4(vert.position, 1.0),
+        vert.uvs,
+    );
+        
     return out;
 }
 ```
@@ -170,11 +194,16 @@ fn main() {
 }
 ```
 
-An rsl shader tree can have as many modules as you want.
+An RSL shader tree can have as many modules as you want.
+
+
+---
 
 ### Data Consolidation
 
-Currently, all data which is to be buffered from cpu to gpu must be described by developers multiple times. The first is in the shader itself. Above, both `ObjectUniforms` and `VertexInput` are input data structs. After defining them in the shader, you have to redefine them in Rust:
+#### Life before `wgsl-rs`
+
+Currently, all data which is to be buffered from cpu to gpu must be described by developers multiple times. The first is in the shader itself. Above, both `ObjectUniforms` and `VertexInput` are gpu input data structs (one represents per-vertex data, while the other is a uniform). After defining them in the shader, you have to redefine them in Rust, which would look something like this:
 
 ```rust
 #[repr(C)]
@@ -191,7 +220,7 @@ struct VertexInput {
 }
 ```
 
-Then, you "define" the vertex attribute structs a third time, to use in your render pipeline:
+Uniform structs derive from `bytemuck` so that we can write them to a byte buffer each frame. Vertex data is only buffered on start. You then have to describe the vertex attribute structure a _third_ time, to use in your render pipeline:
 
 
 ```rust
@@ -213,9 +242,11 @@ let vertex_input_layout = wgpu::VertexBufferLayout {
 };
 ```
 
-To make this a better experience, `wgsl-rs` can eliminate all redefinition by generating vertex attribute structs, uniform structs, and vertex buffer layouts from your shader code.
+#### The `wgsl-rs` Experience
 
-Generating structs for uniforms and vertex inputs is as simple as decorating your shader code with macros. We can do so for the object uniforms in`object.rsl`:
+To improve this, `wgsl-rs` can eliminate _all_ structure redefinition by generating vertex attribute structs, uniform structs, and vertex buffer layouts in Rust, directly from your shader code, at compile time. Generating structs for uniforms and vertex inputs is as simple as decorating their shader definitions with the `#[uniform]` or `#[vertex]` macros. 
+
+In `object.rsl` from the original example:
 ```rust
 #[uniform]
 pub struct ObjectUniforms {
@@ -232,29 +263,37 @@ struct VertexInput {
 };
 ```
 
+---
+
+### Opinionated Syntax
+
+RSL features a more complete Rust-like syntax than WGSL. Some may prefer the traditional GLSL experience, and others WGSL. I argue that RSL is preferrable to both, because:
+- It has features that they do not, such as enums and pub/use.
+- Strict adherance to Rust syntax is preferrable to a mix of Rust and GLSL.
+
 <!--
 ## Intro to GPUs
 The next few sections form a short introduction to modern gpu programming standards/architecture/hardware. It is targeted towards graphics programmers who are new to `wgpu` but have used other graphics APIs before. However, it is also written to be comprehendible by the average non-graphics programmer, so feel free to skip ahead if this is below you. The wgpu-specific section starts [here](#what-is-wgpu).
 
 #### What is GPU programming?
-GPU/graphics programming is a unique & far-reaching area of software. The term began as a general reference to all the processes involved in getting computers to display pixels on a screen. Nowadays, as the performant architecture of GPUs has become desirable in other fields, the term "gpu programming" can be more abstractly redefined as everything involved with writing programs which take advantage of both central and graphics processors.
+GPU/graphics programming is a unique & far-reaching area of software. The term began as a general reference to all the processes involved in getting computers to display pixels on a screen. Nowadays, as the performant architecture of GPUs has become desirable in other fields, the term "gpu programming" refers to everything involved with writing programs which take advantage of both the central and graphics processors.
 
 #### Why do we need GPUs?
-Most modern CPUs contain 4-8 cores. Cores are like workers capable of executing tasks. More cores allows for more tasks to be executed simultaneously. By design, the number of cores in a GPU far eclipses that of your average CPU. This makes it ideal for situations in which a larger task can be subdivided into many smaller tasks which _do not depend on each other_, and can thus be run in parallel.
+Most modern CPUs contain 4-8 cores. Cores are like workers capable of executing tasks. More cores allows for more tasks to be executed simultaneously. By design, the number of cores in a GPU far eclipses that of your average CPU. This makes it ideal for situations in which a larger task can be subdivided into many smaller tasks which do not depend on each other and can thus be run in parallel.
 
 #### Why do we still need CPUs if GPUs have more cores?
 Two general reasons:
-- Most tasks cannot be broken up into hundreds of independent subtasks, because the subtasks end up forming a complex, nonuniform temporal dependency graph.
-- CPU cores and GPU cores are not the same; CPUs are optimized to do many things well, while GPUs are designed as a hardware acceleration for a specific _type_ of problem.
+- Most tasks cannot be broken up into hundreds of independent subtasks, because the subtasks end up forming a complex graph of dependencies.
+- CPU cores and GPU cores are not the same; CPUs are optimized to do many things well, while GPUs are designed as a hardware acceleration for a specific type of problem.
 
 #### What is a graphics API?
-Graphics APIs facilitate running operations on the GPU from the CPU. Unless you are a hardware engineer at Nvidia, graphics APIs are the lowest-level interfaces to the gpu that you can use. Major features they provide include:
+Graphics APIs help developers run operations on the GPU from the CPU. Unless you're a hardware engineer at Nvidia, a graphics API is likely the lowest-level interface to the gpu that you have access to. Major features include:
 
 - Generation of gpu-executable machine code, usually via some shading language like GLSL, HLSL, or WGSL.
 - Control over gpu memory allocation, mutation, and liberation from the cpu, usually by requiring the user to maintain two descriptions of their data (one for cpu and one for gpu).
-- Control over the gpu pipeline structure (via defining the synchronous series of asynchronous shaders, buffer visibilities/formats, data flow, etc).
+- Control over the gpu pipeline structure (via defining processing stages, memory scope and format, and other configuration).
 
-Together, these solutions allow graphics APIs to act as the main interface for programmers interested in writing parallel tasks (also known as _shaders_) which run on the GPU. The following is a description of the major ones in use today.
+Together, these features allow a graphics API to act as the main interface for programmers interested in writing parallel tasks (also known as _shaders_) which run on the GPU. The following is a description of the major/standard APIs in use today.
 
 | Name | Description |
 | --- | --- |
