@@ -10,38 +10,191 @@ use nom::{
     IResult,
 };
 
-// Items (top level):
-//  - V1 Types:
-//      - Convert all types from RSL -> WGSL
-//  - V1 Imports:
-//      - Linking
-//  - V1`Structs
-//      - #[vertex] generate Rust, [[layout]]
-//      - #[uniform] generate Rust, [[block]]
-//      - #[transport] generate builtin #[position] binding
-//      - generate constructors with ::new()
-//  - V0 Functions
-//      - entrypoints take uniforms as arguments
-//      - functions can be split over whitespace without issue
-//  - V0 Bindings
-//      - group binding are generated based on func arg order
-//  - V0 Global vars
-//      - get rid of these?
-//  - V1 Comments
+//
+//
+// -----------------------------------------
+// -----   RSL Compiler Architecture   -----
+// -----------------------------------------
+//
+//
+// Stage 1: AST Parser
+//
+//  a source is a single .rsl file.
+//  each source is parsed into an abstract syntax tree.
+//
+//  AST Component       Structure
+//  -----------------------------------------------------
+//  - syntaxtree        [sourceentry]
+//  - node              || comment, import, struct, function ||
+//
+//  - type              || all supported types ||
+//  - import            { ident, scope }
+//  - scope             { ident, || module{ident}, common || }
+//  - struct            { ident, public, [entry], attribute? }
+//  - entry             { ident, type, location?, builtin? }
+//  - attribute         || vertex, transport, uniform, custom{ident} ||
+//  - function          { ident, public, [arg], output, block }
+//  - arg               { ident, type, attribute? }
+//  - statement         || declaration, bloc, expression ||
+//  - declaration       { ident, type, expression }
+//  - bloc              || if, loop ||
+//  - if                { expression, block }
+//  - loop              { ident, iteration, block }
+//  - iteration         || TODO range{u32, u32}, TODO array{ident}, infinite ||
+//  - block             { [statement], expression? }
+//  - expression        { string }
+//  - comment           { string }
+//
+//
+// Stage 2: Linker
+//
+//  vert/frag asts in each module are merged into one ast per module.
+//  imports are cloned into each module ast.
+//
+//
+// Stage 3: Rust Generator
+//
+//  structs with the vertex attribute are used to generate wgsl rust.
+//  structs with the uniform attribute are used to generate wgsl rust.
+//  the rsl module trees are now ready to be transpiled into wgsl.
+//
+//
+// Stage 4: WGSL Transpiler
+//
+//  AST Component       Mode
+//  -----------------------------------------------------
+//  - syntaxtree        inherited
+//  - node              inherited
+//
+//  - type              mapped
+//  - import            n/a
+//  - scope             n/a
+//  - struct            computed (mut: transport layouts, builtin attrs, [[block]] uniforms)
+//  - entry             inherited
+//  - attribute         n/a
+//  - function          computed (mut: uniform args)
+//  - arg               inherited
+//  - statement         inherited
+//  - declaration       inherited
+//  - bloc              inherited
+//  - if                inherited
+//  - loop              inherited
+//  - iteration         computed (mut: todo)
+//  - block             inherited
+//  - expression        computed (mut: struct constructors)
+//  - comment           inlined
+//
+//
 
 pub fn parse(i: &str) -> SyntaxTree {
     todo!()
 }
 
 pub fn test() -> String {
-    let test_in = "let screen_pos = camera.view_proj * Vec4::new(vert.position, 1.0);";
+    let test_in = "
+    use camera::CameraData;
+
+    #[vertex]
+    struct VertexInput {
+        position: Vec3,
+        uvs: Vec2,
+    }
+    
+    #[transport]
+    pub struct VertexOutput {
+        #[position]: Vec4,
+        uvs: Vec2,
+    }
+
+    fn main(
+        vert: VertexInput,
+        #[uniform] camera: CameraData,
+    ) -> VertexOutput {
+        let screen_pos = camera.view_proj * Vec4::new(vert.position, 1.0);
+    
+        let mut x: i32 = 0;
+        loop {
+            x += 1;
+            break;
+        }
+    
+        VertexOutput::new(
+            screen_pos,
+            vert.uvs,
+        )
+    }
+    
+    ";
 
     type E<'a> = nom::error::Error<&'a str>;
 
-    let (todo, p_out) = Statement::parse::<E>(test_in).unwrap();
-    let t0 = format!("todo: {:?}\ndone: {:#?}", todo, p_out);
+    let (todo, p_out) = SyntaxTree::parse::<E>(test_in).unwrap();
+    let t0 = format!(
+        "\ntest input:\n-----\n{}\n\ntest output:\n-----\n{:#?}\n",
+        todo, p_out
+    );
 
     format!("\n\nTEST: \n{}\n\n", t0)
+}
+
+#[derive(Debug)]
+pub struct SyntaxTree {
+    pub nodes: Vec<Node>,
+}
+
+impl SyntaxTree {
+    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, SyntaxTree> {
+        let (rem, nodes) = fold_many0(Node::parse::<E>, Vec::new, |mut acc: Vec<_>, item| {
+            acc.push(item);
+            acc
+        })(i)?;
+
+        let (rem, _) = opt(basic::sep)(rem)?;
+        if rem.len() != 0 {
+            warn!("failed to parse node from:\n{}", rem);
+        }
+
+        Ok((i, SyntaxTree { nodes }))
+    }
+}
+
+#[derive(Debug)]
+pub enum Node {
+    Comment,
+    Dependency(Dependency),
+    Struct(Struct),
+    Function(Function),
+}
+
+impl Node {
+    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
+        trace!("maybe node: {:?}", i);
+
+        let (rem, _) = basic::sep(i)?;
+        let (rem, node) = alt((
+            Self::parse_dependency::<E>,
+            Self::parse_struct::<E>,
+            Self::parse_function::<E>,
+        ))(rem)?;
+
+        trace!("found node: {:#?}", node);
+        Ok((rem, node))
+    }
+
+    fn parse_dependency<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
+        let (rem, dep) = Dependency::parse(i)?;
+        Ok((rem, Node::Dependency(dep)))
+    }
+
+    fn parse_struct<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
+        let (rem, parsed_struct) = Struct::parse::<E>(i)?;
+        Ok((rem, Node::Struct(parsed_struct)))
+    }
+
+    fn parse_function<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
+        let (rem, func) = Function::parse::<E>(i)?;
+        Ok((rem, Node::Function(func)))
+    }
 }
 
 #[derive(Debug)]
@@ -55,6 +208,7 @@ pub struct Function {
 
 impl Function {
     pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Function> {
+        trace!("maybe function: {:?}", i);
         let (rem, public) = opt(basic::k_pub)(i)?;
         let public = match public {
             Some(_) => true,
@@ -74,16 +228,16 @@ impl Function {
         let (rem, _) = basic::sep(rem)?;
         let (rem, block) = Block::parse::<E>(rem)?;
 
-        Ok((
-            rem,
-            Function {
-                ident: ident.to_owned(),
-                public,
-                args,
-                output,
-                block,
-            },
-        ))
+        let func = Function {
+            ident: ident.to_owned(),
+            public,
+            args,
+            output,
+            block,
+        };
+
+        debug!("found function: {:#?}", func);
+        Ok((rem, func))
     }
 
     fn parse_output<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Type> {
@@ -138,23 +292,41 @@ impl Arg {
 }
 
 #[derive(Debug)]
-pub struct BodyEntry {}
-impl BodyEntry {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, BodyEntry> {
-        todo!()
-    }
-}
-
-#[derive(Debug)]
 pub struct Block {
     pub body: Vec<Statement>,
-    pub tail: Expression,
-    pub tail_statement: bool,
+    pub tail: Option<Expression>,
 }
 
 impl Block {
     pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Block> {
-        todo!()
+        trace!("maybe block: {:?}", i);
+        let (rem, _) = tuple((tag("{"), basic::sep))(i)?;
+        let (rem, mut body) =
+            fold_many0(Statement::parse::<E>, Vec::new, |mut acc: Vec<_>, item| {
+                acc.push(item);
+                acc
+            })(rem)?;
+
+        let (rem, _) = opt(basic::sep)(rem)?;
+        let (rem, maybe_end) = opt(tag("}"))(rem)?;
+
+        // no tail
+        if maybe_end.is_some() {
+            let block = Block { tail: None, body };
+            debug!("found block: {:#?}", block);
+            return Ok((rem, block));
+
+        // tail
+        } else {
+            let (rem, tail_expr) = Expression::parse_tail::<E>(rem)?;
+            let (rem, _) = tag("}")(rem)?;
+            let block = Block {
+                tail: Some(tail_expr),
+                body,
+            };
+            debug!("found block: {:#?}", block);
+            Ok((rem, block))
+        }
     }
 }
 
@@ -183,15 +355,24 @@ pub enum Statement {
 
 impl Statement {
     pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Statement> {
+        trace!("maybe statement: {:?}", i);
         // declarations & blocs
         let maybe = alt((Self::parse_let::<E>, Self::parse_bloc::<E>))(i).ok();
         if let Some((rem, statement)) = maybe {
+            debug!("found statement: {:#?}", statement);
             return Ok((rem, statement));
         }
 
         // naked expressions
-        let (rem, expr) = Expression::parse::<E>(i)?;
-        return Ok((rem, Statement::Expr { expr }));
+        let (mut rem, (expr, _)) = tuple((Expression::parse::<E>, tag(";")))(i)?;
+        if rem.len() > 0 {
+            let rem_ = opt(basic::sep)(rem)?;
+            rem = rem_.0;
+        }
+
+        let statement = Statement::Expr { expr };
+        debug!("found statement expr: {:#?}", statement);
+        return Ok((rem, statement));
     }
 
     fn parse_bloc<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Statement> {
@@ -200,14 +381,15 @@ impl Statement {
     }
 
     fn parse_let<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Statement> {
-        let (rem, (_, ident)) = tuple((basic::sep, basic::ident))(i)?;
+        let (rem, (_, _, ident)) = tuple((basic::k_let, basic::sep, basic::ident))(i)?;
         let (rem, item_type) = opt(Self::parse_type::<E>)(rem)?;
-        let (rem, (_, _, _, expr, _)) = tuple((
+        let (rem, (_, _, _, expr, _, _)) = tuple((
             basic::sep,
             tag("="),
             basic::sep,
             Expression::parse::<E>,
             tag(";"),
+            basic::sep,
         ))(rem)?;
 
         Ok((
@@ -231,12 +413,12 @@ impl Statement {
 pub enum Bloc {
     If {
         cond: Expression,
-        block: Block,
+        block: Rc<Block>,
     },
     Loop {
         item: Option<String>,
         iter: Iteration,
-        block: Block,
+        block: Rc<Block>,
     },
 }
 
@@ -254,7 +436,13 @@ impl Bloc {
             Block::parse::<E>,
         ))(i)?;
 
-        Ok((rem, Bloc::If { cond, block }))
+        Ok((
+            rem,
+            Bloc::If {
+                cond,
+                block: Rc::new(block),
+            },
+        ))
     }
 
     fn parse_loop<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Bloc> {
@@ -262,7 +450,10 @@ impl Bloc {
         if let Some(bloc) = maybe_bloc {
             return Ok((rem, bloc));
         }
-        todo!()
+        IResult::Err(nom::Err::Error(nom::error::Error::new(
+            "todo: finish loop parser",
+            nom::error::ErrorKind::Fail,
+        )))
     }
 
     fn parse_loop_infinite<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Bloc> {
@@ -272,7 +463,7 @@ impl Bloc {
             Bloc::Loop {
                 item: None,
                 iter: Iteration::Infinite,
-                block,
+                block: Rc::new(block),
             },
         ))
     }
@@ -293,30 +484,57 @@ pub struct Expression {
 
 impl Expression {
     const END_CHARS: &'static str = ";{";
+    const TAIL_END_CHARS: &'static str = ";{}";
 
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Expression> {
-        let (mut rem, outer) = take_while(|c| !Self::END_CHARS.contains(c))(i)?;
-        let mut block: Option<Rc<Block>> = None;
-        if &rem[..1] == "{" {
+    fn parse_tail<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Expression> {
+        trace!("maybe tail: {:?}", i);
+        if i.len() == 0 {
+            return Err(nom::Err::Error(nom::error_position!(
+                "no expression",
+                nom::error::ErrorKind::Fail
+            )));
+        }
+
+        let (mut rem, outer) = take_while(|c| !Self::TAIL_END_CHARS.contains(c))(i)?;
+        let mut expr = Expression {
+            outer: outer.to_owned(),
+            block: None,
+        };
+
+        if rem.len() > 0 && &rem[..1] == "{" {
             let (p_rem, p_block) = Block::parse::<E>(rem)?;
             rem = p_rem;
-            block = Some(Rc::new(p_block));
+            expr.block = Some(Rc::new(p_block));
         }
-        Ok((
-            rem,
-            Expression {
-                outer: outer.to_owned(),
-                block,
-            },
-        ))
+
+        debug!("found tail: {:#?}", expr);
+        Ok((rem, expr))
     }
-}
 
-pub struct SyntaxTree {}
+    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Expression> {
+        trace!("maybe expression: {:?}", i);
+        if i.len() == 0 {
+            return Err(nom::Err::Error(nom::error_position!(
+                "no expression",
+                nom::error::ErrorKind::Fail
+            )));
+        }
 
-// Source represents a single RSL file
-pub struct Source {
-    pub deps: Vec<Dependency>,
+        let (mut rem, outer) = take_while(|c| !Self::END_CHARS.contains(c))(i)?;
+        let mut expr = Expression {
+            outer: outer.to_owned(),
+            block: None,
+        };
+
+        if rem.len() > 0 && &rem[..1] == "{" {
+            let (p_rem, p_block) = Block::parse::<E>(rem)?;
+            rem = p_rem;
+            expr.block = Some(Rc::new(p_block));
+        }
+
+        debug!("found expression: {:#?}", expr);
+        Ok((rem, expr))
+    }
 }
 
 #[derive(Debug)]
@@ -339,6 +557,7 @@ pub struct Dependency {
 
 impl Dependency {
     pub fn parse(i: &str) -> IResult<&str, Dependency> {
+        trace!("maybe dependency: {:?}", i);
         let (input, (_, _, scope, _, ident, _)) = tuple((
             basic::k_use,
             basic::sep,
@@ -348,25 +567,25 @@ impl Dependency {
             tag(";"),
         ))(i)?;
 
-        Ok((
-            input,
-            Dependency {
-                scope: match scope {
-                    "vert" => Scope::Module {
-                        name: "vert".to_owned(),
-                        stage: ShaderStage::Vertex,
-                    },
-                    "frag" => Scope::Module {
-                        name: "frag".to_owned(),
-                        stage: ShaderStage::Fragment,
-                    },
-                    _ => Scope::Common {
-                        name: scope.to_owned(),
-                    },
+        let dep = Dependency {
+            scope: match scope {
+                "vert" => Scope::Module {
+                    name: "vert".to_owned(),
+                    stage: ShaderStage::Vertex,
                 },
-                ident: ident.to_owned(),
+                "frag" => Scope::Module {
+                    name: "frag".to_owned(),
+                    stage: ShaderStage::Fragment,
+                },
+                _ => Scope::Common {
+                    name: scope.to_owned(),
+                },
             },
-        ))
+            ident: ident.to_owned(),
+        };
+
+        debug!("found dependency: {:#?}", dep);
+        Ok((input, dep))
     }
 }
 
@@ -380,8 +599,10 @@ pub struct Struct {
 
 impl Struct {
     pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Struct> {
+        trace!("maybe struct: {:?}", i);
         let mut attr: Option<Attr> = None;
         let mut rem: &str = i;
+
         if let Some((p_rem, (_, p_attr))) = consumed(Attr::parse::<E>)(i).ok() {
             match p_attr {
                 Attr::Vertex => attr = Some(Attr::Vertex),
@@ -420,16 +641,15 @@ impl Struct {
         )(rem)?;
 
         let (rem, _) = tuple((basic::sep, tag("}")))(rem)?;
+        let parsed_struct = Struct {
+            ident: ident.to_owned(),
+            public,
+            entries,
+            attr,
+        };
 
-        Ok((
-            rem,
-            Struct {
-                ident: ident.to_owned(),
-                public,
-                entries,
-                attr,
-            },
-        ))
+        debug!("found struct: {:#?}", parsed_struct);
+        Ok((rem, parsed_struct))
     }
 }
 

@@ -1,4 +1,7 @@
+extern crate pretty_env_logger;
 extern crate proc_macro;
+#[macro_use]
+extern crate log;
 
 use anyhow::{anyhow, Result};
 use proc_macro::TokenStream;
@@ -10,6 +13,9 @@ mod rsl;
 
 #[proc_macro_attribute]
 pub fn shaders(attr: TokenStream, item: TokenStream) -> TokenStream {
+    std::env::set_var("RUST_LOG", "trace");
+    pretty_env_logger::init();
+
     let out = rsl::test();
     return quote!(
         pub fn test_macro() {
