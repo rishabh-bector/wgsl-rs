@@ -1,93 +1,19 @@
-use std::rc::Rc;
-
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take, take_while, take_while1},
-    combinator::{consumed, map_parser, map_res, opt, recognize},
-    error::{FromExternalError, ParseError},
+    bytes::complete::{tag, take, take_while},
+    combinator::{consumed, opt},
     multi::fold_many0,
     sequence::tuple,
     IResult,
 };
-
-//
-//
-// -----------------------------------------
-// -----   RSL Compiler Architecture   -----
-// -----------------------------------------
-//
-//
-// Stage 1: AST Parser
-//
-//  a source is a single .rsl file.
-//  each source is parsed into an abstract syntax tree.
-//
-//  AST Component       Structure
-//  -----------------------------------------------------
-//  - syntaxtree        [sourceentry]
-//  - node              || comment, import, struct, function ||
-//
-//  - type              || all supported types ||
-//  - import            { ident, scope }
-//  - scope             { ident, || module{ident}, common || }
-//  - struct            { ident, public, [entry], attribute? }
-//  - entry             { ident, type, location?, builtin? }
-//  - attribute         || vertex, transport, uniform, custom{ident} ||
-//  - function          { ident, public, [arg], output, block }
-//  - arg               { ident, type, attribute? }
-//  - statement         || declaration, bloc, expression ||
-//  - declaration       { ident, type, expression }
-//  - bloc              || if, loop ||
-//  - if                { expression, block }
-//  - loop              { ident, iteration, block }
-//  - iteration         || TODO range{u32, u32}, TODO array{ident}, infinite ||
-//  - block             { [statement], expression? }
-//  - expression        { string }
-//  - comment           { string }
-//
-//
-// Stage 2: Linker
-//
-//  vert/frag asts in each module are merged into one ast per module.
-//  imports are cloned into each module ast.
-//
-//
-// Stage 3: Rust Generator
-//
-//  structs with the vertex attribute are used to generate wgsl rust.
-//  structs with the uniform attribute are used to generate wgsl rust.
-//  the rsl module trees are now ready to be transpiled into wgsl.
-//
-//
-// Stage 4: WGSL Transpiler
-//
-//  AST Component       Mode
-//  -----------------------------------------------------
-//  - syntaxtree        inherited
-//  - node              inherited
-//
-//  - type              mapped
-//  - import            n/a
-//  - scope             n/a
-//  - struct            computed (mut: transport layouts, builtin attrs, [[block]] uniforms)
-//  - entry             inherited
-//  - attribute         n/a
-//  - function          computed (mut: uniform args)
-//  - arg               inherited
-//  - statement         inherited
-//  - declaration       inherited
-//  - bloc              inherited
-//  - if                inherited
-//  - loop              inherited
-//  - iteration         computed (mut: todo)
-//  - block             inherited
-//  - expression        computed (mut: struct constructors)
-//  - comment           inlined
-//
-//
+use serde::Serialize;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 pub fn parse(i: &str) -> SyntaxTree {
-    todo!()
+    SyntaxTree::parse(i).unwrap().1
 }
 
 pub fn test() -> String {
@@ -106,6 +32,7 @@ pub fn test() -> String {
         uvs: Vec2,
     }
 
+    // This is a commment.
     fn main(
         vert: VertexInput,
         #[uniform] camera: CameraData,
@@ -126,9 +53,7 @@ pub fn test() -> String {
     
     ";
 
-    type E<'a> = nom::error::Error<&'a str>;
-
-    let (todo, p_out) = SyntaxTree::parse::<E>(test_in).unwrap();
+    let (todo, p_out) = SyntaxTree::parse(test_in).unwrap();
     let t0 = format!(
         "\ntest input:\n-----\n{}\n\ntest output:\n-----\n{:#?}\n",
         todo, p_out
@@ -137,14 +62,20 @@ pub fn test() -> String {
     format!("\n\nTEST: \n{}\n\n", t0)
 }
 
+pub type E<'a> = nom::error::Error<&'a str>;
+
 #[derive(Debug)]
 pub struct SyntaxTree {
+    pub deps: Vec<Dependency>,
     pub nodes: Vec<Node>,
+    pub exports: HashMap<String, Arc<RwLock<Node>>>,
+    pub links: Vec<Arc<RwLock<Node>>>,
 }
 
 impl SyntaxTree {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, SyntaxTree> {
-        let (rem, nodes) = fold_many0(Node::parse::<E>, Vec::new, |mut acc: Vec<_>, item| {
+    // Parse an RSL source file into an abstract syntax tree.
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, SyntaxTree> {
+        let (rem, mut nodes) = fold_many0(Node::parse, Vec::new, |mut acc: Vec<_>, item| {
             acc.push(item);
             acc
         })(i)?;
@@ -154,405 +85,142 @@ impl SyntaxTree {
             warn!("failed to parse node from:\n{}", rem);
         }
 
-        Ok((i, SyntaxTree { nodes }))
+        let mut exports: HashMap<String, Node> = HashMap::new();
+        for i in 0..nodes.len() {
+            if nodes[i].is_pub() {
+                exports.insert(nodes[i].ident().to_owned(), nodes.swap_remove(i));
+            }
+        }
+
+        Ok((
+            i,
+            SyntaxTree {
+                deps: Self::pop_deps(&mut nodes),
+                exports: exports
+                    .into_iter()
+                    .map(|(ident, node)| (ident, Arc::new(RwLock::new(node))))
+                    .collect(),
+                nodes,
+                links: vec![],
+            },
+        ))
     }
+
+    // Drain all import statements from the tree.
+    fn pop_deps(nodes: &mut Vec<Node>) -> Vec<Dependency> {
+        let mut deps: Vec<Node> = vec![];
+        for i in 0..nodes.len() {
+            if nodes[i].is_dep() {
+                deps.push(nodes.swap_remove(i))
+            }
+        }
+
+        deps.into_iter()
+            .map(|node| match node {
+                Node::Dependency(dep) => dep,
+                _ => panic!("bruh"),
+            })
+            .collect()
+    }
+
+    // Drain all nodes from the tree.
+    pub fn pop_nodes(&mut self) -> Vec<Node> {
+        self.nodes.drain(..).collect()
+    }
+
+    // Add a linked node.
+    pub fn link(&mut self, node: Arc<RwLock<Node>>) {
+        self.links.push(node)
+    }
+
+    // Get a node by ID
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Debug)]
 pub enum Node {
-    Comment,
+    Comment(String),
     Dependency(Dependency),
     Struct(Struct),
     Function(Function),
 }
 
 impl Node {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
+    pub fn is_dep(&self) -> bool {
+        match &self {
+            Node::Dependency(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_pub(&self) -> bool {
+        match &self {
+            Node::Struct(inner) => inner.public,
+            Node::Function(inner) => inner.public,
+            _ => false,
+        }
+    }
+
+    pub fn ident(&self) -> &str {
+        match &self {
+            Node::Comment(_) => "comment",
+            Node::Dependency(inner) => &inner.ident,
+            Node::Struct(inner) => &inner.ident,
+            Node::Function(inner) => &inner.ident,
+        }
+    }
+
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Node> {
         trace!("maybe node: {:?}", i);
 
         let (rem, _) = basic::sep(i)?;
         let (rem, node) = alt((
-            Self::parse_dependency::<E>,
-            Self::parse_struct::<E>,
-            Self::parse_function::<E>,
+            Self::parse_dependency,
+            Self::parse_struct,
+            Self::parse_function,
+            Self::parse_comment,
         ))(rem)?;
 
         trace!("found node: {:#?}", node);
         Ok((rem, node))
     }
 
-    fn parse_dependency<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
+    fn parse_dependency<'a>(i: &'a str) -> IResult<&str, Node> {
         let (rem, dep) = Dependency::parse(i)?;
         Ok((rem, Node::Dependency(dep)))
     }
 
-    fn parse_struct<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
-        let (rem, parsed_struct) = Struct::parse::<E>(i)?;
+    fn parse_struct<'a>(i: &'a str) -> IResult<&str, Node> {
+        let (rem, parsed_struct) = Struct::parse(i)?;
         Ok((rem, Node::Struct(parsed_struct)))
     }
 
-    fn parse_function<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Node> {
-        let (rem, func) = Function::parse::<E>(i)?;
+    fn parse_function<'a>(i: &'a str) -> IResult<&str, Node> {
+        let (rem, func) = Function::parse(i)?;
         Ok((rem, Node::Function(func)))
     }
+
+    fn parse_comment<'a>(i: &'a str) -> IResult<&str, Node> {
+        let (rem, comment) = basic::comment(i)?;
+        Ok((rem, Node::Comment(comment.0)))
+    }
 }
 
-#[derive(Debug)]
-pub struct Function {
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct Dependency {
     pub ident: String,
-    pub public: bool,
-    pub args: Vec<Arg>,
-    pub output: Option<Type>,
-    pub block: Block,
+    pub scope: Scope,
 }
 
-impl Function {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Function> {
-        trace!("maybe function: {:?}", i);
-        let (rem, public) = opt(basic::k_pub)(i)?;
-        let public = match public {
-            Some(_) => true,
-            None => false,
-        };
-
-        let (rem, (_, _, _, ident, _)) =
-            tuple((basic::sep, basic::k_fn, basic::sep, basic::ident, tag("(")))(rem)?;
-
-        let (rem, args) = fold_many0(Arg::parse::<E>, Vec::new, |mut acc: Vec<_>, item| {
-            acc.push(item);
-            acc
-        })(rem)?;
-
-        let (rem, _) = tag(")")(rem)?;
-        let (rem, output) = opt(Self::parse_output::<E>)(rem)?;
-        let (rem, _) = basic::sep(rem)?;
-        let (rem, block) = Block::parse::<E>(rem)?;
-
-        let func = Function {
-            ident: ident.to_owned(),
-            public,
-            args,
-            output,
-            block,
-        };
-
-        debug!("found function: {:#?}", func);
-        Ok((rem, func))
-    }
-
-    fn parse_output<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Type> {
-        let (rem, (_, _, _, output, _)) = tuple((
-            basic::sep,
-            tag("->"),
-            basic::sep,
-            Type::parse::<E>,
-            basic::sep,
-        ))(i)?;
-        Ok((rem, output))
-    }
-}
-
-#[derive(Debug)]
-pub struct Arg {
-    ident: String,
-    attr: Option<Attr>,
-    item_type: Type,
-}
-
-impl Arg {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Arg> {
-        let mut attr: Option<Attr> = None;
-        let mut rem: &str = i;
-        if let Some((p_rem, (_, p_attr))) = consumed(Attr::parse::<E>)(i).ok() {
-            match p_attr {
-                Attr::Vertex => attr = Some(Attr::Vertex),
-                Attr::Uniform => attr = Some(Attr::Uniform),
-                Attr::Transport => attr = Some(Attr::Transport),
-                _ => {}
-            }
-            rem = p_rem;
-        }
-
-        let (rem, _) = opt(basic::sep)(rem)?;
-        let (rem, (ident, _, _, item_type)) =
-            tuple((basic::ident, tag(":"), basic::sep, Type::parse::<E>))(rem)?;
-
-        let (rem, _) = opt(tag(","))(rem)?;
-        let (rem, _) = opt(basic::sep)(rem)?;
-
-        Ok((
-            rem,
-            Arg {
-                ident: ident.to_owned(),
-                item_type,
-                attr,
-            },
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub struct Block {
-    pub body: Vec<Statement>,
-    pub tail: Option<Expression>,
-}
-
-impl Block {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Block> {
-        trace!("maybe block: {:?}", i);
-        let (rem, _) = tuple((tag("{"), basic::sep))(i)?;
-        let (rem, mut body) =
-            fold_many0(Statement::parse::<E>, Vec::new, |mut acc: Vec<_>, item| {
-                acc.push(item);
-                acc
-            })(rem)?;
-
-        let (rem, _) = opt(basic::sep)(rem)?;
-        let (rem, maybe_end) = opt(tag("}"))(rem)?;
-
-        // no tail
-        if maybe_end.is_some() {
-            let block = Block { tail: None, body };
-            debug!("found block: {:#?}", block);
-            return Ok((rem, block));
-
-        // tail
-        } else {
-            let (rem, tail_expr) = Expression::parse_tail::<E>(rem)?;
-            let (rem, _) = tag("}")(rem)?;
-            let block = Block {
-                tail: Some(tail_expr),
-                body,
-            };
-            debug!("found block: {:#?}", block);
-            Ok((rem, block))
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Statement {
-    // Item Declarations:
-    //
-    // let <ident>: item_type = <expr>;
-    // let <ident> = <expr>;
-    Decl {
-        ident: String,
-        item_type: Option<Type>,
-        expr: Expression,
-    },
-    // Naked expressions:
-    //
-    // <expr>;
-    Expr {
-        expr: Expression,
-    },
-    //  Control blocs:
-    //
-    // <ident> <outer> { <block> }
-    Bloc(Bloc),
-}
-
-impl Statement {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Statement> {
-        trace!("maybe statement: {:?}", i);
-        // declarations & blocs
-        let maybe = alt((Self::parse_let::<E>, Self::parse_bloc::<E>))(i).ok();
-        if let Some((rem, statement)) = maybe {
-            debug!("found statement: {:#?}", statement);
-            return Ok((rem, statement));
-        }
-
-        // naked expressions
-        let (mut rem, (expr, _)) = tuple((Expression::parse::<E>, tag(";")))(i)?;
-        if rem.len() > 0 {
-            let rem_ = opt(basic::sep)(rem)?;
-            rem = rem_.0;
-        }
-
-        let statement = Statement::Expr { expr };
-        debug!("found statement expr: {:#?}", statement);
-        return Ok((rem, statement));
-    }
-
-    fn parse_bloc<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Statement> {
-        let (rem, bloc) = Bloc::parse::<E>(i)?;
-        Ok((rem, Statement::Bloc(bloc)))
-    }
-
-    fn parse_let<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Statement> {
-        let (rem, (_, _, ident)) = tuple((basic::k_let, basic::sep, basic::ident))(i)?;
-        let (rem, item_type) = opt(Self::parse_type::<E>)(rem)?;
-        let (rem, (_, _, _, expr, _, _)) = tuple((
-            basic::sep,
-            tag("="),
-            basic::sep,
-            Expression::parse::<E>,
-            tag(";"),
-            basic::sep,
-        ))(rem)?;
-
-        Ok((
-            rem,
-            Statement::Decl {
-                ident: ident.to_owned(),
-                item_type,
-                expr,
-            },
-        ))
-    }
-
-    fn parse_type<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Type> {
-        let (rem, (_, _, item_type, _)) =
-            tuple((tag(":"), basic::sep, Type::parse::<E>, basic::sep))(i)?;
-        Ok((rem, item_type))
-    }
-}
-
-#[derive(Debug)]
-pub enum Bloc {
-    If {
-        cond: Expression,
-        block: Rc<Block>,
-    },
-    Loop {
-        item: Option<String>,
-        iter: Iteration,
-        block: Rc<Block>,
-    },
-}
-
-impl Bloc {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, Bloc> {
-        alt((Self::parse_if::<E>, Self::parse_loop::<E>))(i)
-    }
-
-    fn parse_if<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Bloc> {
-        let (rem, (_, _, cond, _, block)) = tuple((
-            basic::k_if,
-            basic::sep,
-            Expression::parse::<E>,
-            basic::sep,
-            Block::parse::<E>,
-        ))(i)?;
-
-        Ok((
-            rem,
-            Bloc::If {
-                cond,
-                block: Rc::new(block),
-            },
-        ))
-    }
-
-    fn parse_loop<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Bloc> {
-        let (rem, maybe_bloc) = opt(Self::parse_loop_infinite::<E>)(i)?;
-        if let Some(bloc) = maybe_bloc {
-            return Ok((rem, bloc));
-        }
-        IResult::Err(nom::Err::Error(nom::error::Error::new(
-            "todo: finish loop parser",
-            nom::error::ErrorKind::Fail,
-        )))
-    }
-
-    fn parse_loop_infinite<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Bloc> {
-        let (rem, (_, _, block)) = tuple((basic::k_loop, basic::sep, Block::parse::<E>))(i)?;
-        Ok((
-            rem,
-            Bloc::Loop {
-                item: None,
-                iter: Iteration::Infinite,
-                block: Rc::new(block),
-            },
-        ))
-    }
-}
-
-#[derive(Debug)]
-pub enum Iteration {
-    Range { from: u32, to: u32 },
-    Array { ident: String },
-    Infinite,
-}
-
-#[derive(Debug)]
-pub struct Expression {
-    pub outer: String,
-    pub block: Option<Rc<Block>>,
-}
-
-impl Expression {
-    const END_CHARS: &'static str = ";{";
-    const TAIL_END_CHARS: &'static str = ";{}";
-
-    fn parse_tail<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Expression> {
-        trace!("maybe tail: {:?}", i);
-        if i.len() == 0 {
-            return Err(nom::Err::Error(nom::error_position!(
-                "no expression",
-                nom::error::ErrorKind::Fail
-            )));
-        }
-
-        let (mut rem, outer) = take_while(|c| !Self::TAIL_END_CHARS.contains(c))(i)?;
-        let mut expr = Expression {
-            outer: outer.to_owned(),
-            block: None,
-        };
-
-        if rem.len() > 0 && &rem[..1] == "{" {
-            let (p_rem, p_block) = Block::parse::<E>(rem)?;
-            rem = p_rem;
-            expr.block = Some(Rc::new(p_block));
-        }
-
-        debug!("found tail: {:#?}", expr);
-        Ok((rem, expr))
-    }
-
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Expression> {
-        trace!("maybe expression: {:?}", i);
-        if i.len() == 0 {
-            return Err(nom::Err::Error(nom::error_position!(
-                "no expression",
-                nom::error::ErrorKind::Fail
-            )));
-        }
-
-        let (mut rem, outer) = take_while(|c| !Self::END_CHARS.contains(c))(i)?;
-        let mut expr = Expression {
-            outer: outer.to_owned(),
-            block: None,
-        };
-
-        if rem.len() > 0 && &rem[..1] == "{" {
-            let (p_rem, p_block) = Block::parse::<E>(rem)?;
-            rem = p_rem;
-            expr.block = Some(Rc::new(p_block));
-        }
-
-        debug!("found expression: {:#?}", expr);
-        Ok((rem, expr))
-    }
-}
-
-#[derive(Debug)]
-pub enum ShaderStage {
-    Vertex,
-    Fragment,
-}
-
-#[derive(Debug)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub enum Scope {
     Module { name: String, stage: ShaderStage },
     Common { name: String },
 }
 
-#[derive(Debug)]
-pub struct Dependency {
-    pub ident: String,
-    pub scope: Scope,
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub enum ShaderStage {
+    Vertex,
+    Fragment,
 }
 
 impl Dependency {
@@ -589,7 +257,7 @@ impl Dependency {
     }
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Debug)]
 pub struct Struct {
     pub ident: String,
     pub public: bool,
@@ -598,12 +266,12 @@ pub struct Struct {
 }
 
 impl Struct {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Struct> {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Struct> {
         trace!("maybe struct: {:?}", i);
         let mut attr: Option<Attr> = None;
         let mut rem: &str = i;
 
-        if let Some((p_rem, (_, p_attr))) = consumed(Attr::parse::<E>)(i).ok() {
+        if let Some((p_rem, (_, p_attr))) = consumed(Attr::parse)(i).ok() {
             match p_attr {
                 Attr::Vertex => attr = Some(Attr::Vertex),
                 Attr::Uniform => attr = Some(Attr::Uniform),
@@ -631,14 +299,10 @@ impl Struct {
             basic::sep1,
         ))(rem)?;
 
-        let (rem, entries) = fold_many0(
-            StructEntry::parse::<E>,
-            Vec::new,
-            |mut acc: Vec<_>, item| {
-                acc.push(item);
-                acc
-            },
-        )(rem)?;
+        let (rem, entries) = fold_many0(StructEntry::parse, Vec::new, |mut acc: Vec<_>, item| {
+            acc.push(item);
+            acc
+        })(rem)?;
 
         let (rem, _) = tuple((basic::sep, tag("}")))(rem)?;
         let parsed_struct = Struct {
@@ -653,7 +317,7 @@ impl Struct {
     }
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Debug)]
 pub struct StructEntry {
     pub ident: String,
     pub item_type: Type,
@@ -662,13 +326,12 @@ pub struct StructEntry {
 }
 
 impl StructEntry {
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, StructEntry> {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, StructEntry> {
         let (input, _) = opt(basic::sep)(i)?;
 
-        if let Some((rem, (taken, attr))) = consumed(Attr::parse::<E>)(input).ok() {
+        if let Some((rem, (taken, attr))) = consumed(Attr::parse)(input).ok() {
             if let Attr::Builtin(p_built_in) = attr {
-                let (input, (_, item_type, _)) =
-                    tuple((tag(": "), Type::parse::<E>, tag(",")))(rem)?;
+                let (input, (_, item_type, _)) = tuple((tag(": "), Type::parse, tag(",")))(rem)?;
                 return Ok((
                     input,
                     StructEntry {
@@ -684,7 +347,7 @@ impl StructEntry {
         }
 
         let (input, (ident, _, item_type, _)) =
-            tuple((basic::ident, tag(": "), Type::parse::<E>, tag(",")))(input)?;
+            tuple((basic::ident, tag(": "), Type::parse, tag(",")))(input)?;
 
         Ok((
             input,
@@ -698,7 +361,7 @@ impl StructEntry {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub enum Attr {
     Vertex,
     Uniform,
@@ -716,14 +379,342 @@ impl Attr {
         }
     }
 
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Attr> {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Attr> {
         let (input, (_, p_type, _)) =
             tuple((tag("#["), take_while(|c| c != ']'), take(1usize)))(i)?;
         Ok((input, Attr::from_rsl(p_type.to_owned())))
     }
 }
 
-#[derive(Debug)]
+#[derive(Serialize, Debug)]
+pub struct Function {
+    pub ident: String,
+    pub public: bool,
+    pub args: Vec<Arg>,
+    pub output: Option<Type>,
+    pub block: Block,
+}
+
+impl Function {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Function> {
+        trace!("maybe function: {:?}", i);
+        let (rem, public) = opt(basic::k_pub)(i)?;
+        let public = match public {
+            Some(_) => true,
+            None => false,
+        };
+
+        let (rem, (_, _, _, ident, _)) =
+            tuple((basic::sep, basic::k_fn, basic::sep, basic::ident, tag("(")))(rem)?;
+
+        let (rem, args) = fold_many0(Arg::parse, Vec::new, |mut acc: Vec<_>, item| {
+            acc.push(item);
+            acc
+        })(rem)?;
+
+        let (rem, _) = tag(")")(rem)?;
+        let (rem, output) = opt(Self::parse_output)(rem)?;
+        let (rem, _) = basic::sep(rem)?;
+        let (rem, block) = Block::parse(rem)?;
+
+        let func = Function {
+            ident: ident.to_owned(),
+            public,
+            args,
+            output,
+            block,
+        };
+
+        debug!("found function: {:#?}", func);
+        Ok((rem, func))
+    }
+
+    fn parse_output<'a>(i: &'a str) -> IResult<&str, Type> {
+        let (rem, (_, _, _, output, _)) =
+            tuple((basic::sep, tag("->"), basic::sep, Type::parse, basic::sep))(i)?;
+        Ok((rem, output))
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub struct Arg {
+    ident: String,
+    attr: Option<Attr>,
+    item_type: Type,
+}
+
+impl Arg {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Arg> {
+        let mut attr: Option<Attr> = None;
+        let mut rem: &str = i;
+        if let Some((p_rem, (_, p_attr))) = consumed(Attr::parse)(i).ok() {
+            match p_attr {
+                Attr::Vertex => attr = Some(Attr::Vertex),
+                Attr::Uniform => attr = Some(Attr::Uniform),
+                Attr::Transport => attr = Some(Attr::Transport),
+                _ => {}
+            }
+            rem = p_rem;
+        }
+
+        let (rem, _) = opt(basic::sep)(rem)?;
+        let (rem, (ident, _, _, item_type)) =
+            tuple((basic::ident, tag(":"), basic::sep, Type::parse))(rem)?;
+
+        let (rem, _) = opt(tag(","))(rem)?;
+        let (rem, _) = opt(basic::sep)(rem)?;
+
+        Ok((
+            rem,
+            Arg {
+                ident: ident.to_owned(),
+                item_type,
+                attr,
+            },
+        ))
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub struct Block {
+    pub body: Vec<Statement>,
+    pub tail: Option<Expression>,
+}
+
+impl Block {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Block> {
+        trace!("maybe block: {:?}", i);
+        let (rem, _) = tuple((tag("{"), basic::sep))(i)?;
+        let (rem, body) = fold_many0(Statement::parse, Vec::new, |mut acc: Vec<_>, item| {
+            acc.push(item);
+            acc
+        })(rem)?;
+
+        let (rem, _) = opt(basic::sep)(rem)?;
+        let (rem, _maybe_end) = opt(tag("}"))(rem)?;
+
+        let block = Block { tail: None, body };
+        debug!("found block: {:#?}", block);
+        return Ok((rem, block));
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub enum Statement {
+    // Item Declarations:
+    //
+    // let <ident>: item_type = <expr>;
+    // let <ident> = <expr>;
+    Decl {
+        ident: String,
+        item_type: Option<Type>,
+        expr: Expression,
+    },
+    // line:
+    //  <expr>;
+    // void block:
+    //  loop {}
+    Expr {
+        expr: Expression,
+        output: bool,
+    },
+}
+
+impl Statement {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Statement> {
+        trace!("maybe statement: {:?}", i);
+        let (rem, _) = opt(basic::sep)(i)?;
+        let mut count: usize = 0;
+        let mut state_len: usize = 0;
+        for c in rem.chars() {
+            match c {
+                '{' => {
+                    count += 1;
+                }
+                '}' => {
+                    if count == 0 {
+                        break;
+                    }
+                    count -= 1;
+                    if count == 0 {
+                        state_len += 1;
+                        break;
+                    }
+                }
+                ';' => {
+                    if count == 0 {
+                        state_len += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            state_len += 1;
+        }
+
+        let (extra, rem) = take(state_len)(rem)?;
+        let (extra, _) = opt(basic::sep)(extra)?;
+        debug!("maybe statement_counted: {}", rem);
+
+        // declarations
+        let maybe = Self::parse_let(rem).ok();
+        if let Some((_, statement)) = maybe {
+            debug!("found statement decl: {:#?}", statement);
+            return Ok((extra, statement));
+        }
+
+        // naked expressions
+        let (_, (expr, maybe_end)) = tuple((Expression::parse, opt(tag(";"))))(rem)?;
+        // if rem.len() > 0 {
+        //     let rem_ = opt(basic::sep)(rem)?;
+        //     rem = rem_.0;
+        // }
+
+        let statement = Statement::Expr {
+            expr,
+            output: maybe_end.is_none(),
+        };
+        debug!("found statement expr: {:#?}", statement);
+        return Ok((extra, statement));
+    }
+
+    fn parse_let<'a>(i: &'a str) -> IResult<&str, Statement> {
+        let (rem, (_, _, ident)) = tuple((basic::k_let, basic::sep, basic::ident))(i)?;
+        let (rem, item_type) = opt(Self::parse_type)(rem)?;
+        let (rem, (_, _, _, expr, _, _)) = tuple((
+            basic::sep,
+            tag("="),
+            basic::sep,
+            Expression::parse,
+            tag(";"),
+            basic::sep,
+        ))(rem)?;
+
+        Ok((
+            rem,
+            Statement::Decl {
+                ident: ident.to_owned(),
+                item_type,
+                expr,
+            },
+        ))
+    }
+
+    fn parse_type<'a>(i: &'a str) -> IResult<&str, Type> {
+        let (rem, (_, _, item_type, _)) =
+            tuple((tag(":"), basic::sep, Type::parse, basic::sep))(i)?;
+        Ok((rem, item_type))
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub enum Iteration {
+    Range { from: u32, to: u32 },
+    Array { ident: String },
+    Infinite,
+}
+
+#[derive(Serialize, Debug)]
+pub enum Expression {
+    Line(String),
+    Bloc(Box<Bloc>),
+}
+
+impl Expression {
+    const END_CHARS: &'static str = ";{";
+
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Expression> {
+        trace!("maybe expression: {:?}", i);
+        if i.len() == 0 {
+            return Err(nom::Err::Error(nom::error_position!(
+                "no expression",
+                nom::error::ErrorKind::Fail
+            )));
+        }
+
+        let (rem, maybe_bloc) = opt(Bloc::parse)(i)?;
+        if let Some(bloc) = maybe_bloc {
+            debug!("found expression bloc: {:#?}", bloc);
+            return Ok((rem, Expression::Bloc(Box::new(bloc))));
+        }
+
+        let (rem, outer) = take_while(|c| !Self::END_CHARS.contains(c))(i)?;
+        let expr = Expression::Line(outer.to_owned());
+
+        // if rem.len() > 0 && &rem[..1] == "{" {
+        //     let (p_rem, p_block) = Block::parse(rem)?;
+        //     rem = p_rem;
+        //     expr.block = Some(Rc::new(p_block));
+        // }
+
+        debug!("found expression: {:#?}", expr);
+        Ok((rem, expr))
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub enum Bloc {
+    If {
+        cond: Expression,
+        block: Box<Block>,
+    },
+    Loop {
+        item: Option<String>,
+        iter: Iteration,
+        block: Box<Block>,
+    },
+}
+
+impl Bloc {
+    pub fn parse<'a>(i: &'a str) -> IResult<&'a str, Bloc> {
+        alt((Self::parse_if, Self::parse_loop))(i)
+    }
+
+    fn parse_if<'a>(i: &'a str) -> IResult<&str, Bloc> {
+        trace!("maybe bloc_if: {:?}", i);
+        let (rem, (_, _, cond, _, block)) = tuple((
+            basic::k_if,
+            basic::sep,
+            Expression::parse,
+            basic::sep,
+            Block::parse,
+        ))(i)?;
+
+        let bloc_if = Bloc::If {
+            cond,
+            block: Box::new(block),
+        };
+
+        debug!("found bloc_if: {:#?}", bloc_if);
+        Ok((rem, bloc_if))
+    }
+
+    fn parse_loop<'a>(i: &'a str) -> IResult<&str, Bloc> {
+        trace!("maybe bloc_loop: {:?}", i);
+        let (rem, maybe_bloc) = opt(Self::parse_loop_infinite)(i)?;
+        if let Some(bloc) = maybe_bloc {
+            return Ok((rem, bloc));
+        }
+        IResult::Err(nom::Err::Error(nom::error::Error::new(
+            "todo: finish loop parser",
+            nom::error::ErrorKind::Fail,
+        )))
+    }
+
+    fn parse_loop_infinite<'a>(i: &'a str) -> IResult<&str, Bloc> {
+        let (rem, (_, _, block)) = tuple((basic::k_loop, basic::sep, Block::parse))(i)?;
+        let bloc_loop = Bloc::Loop {
+            item: None,
+            iter: Iteration::Infinite,
+            block: Box::new(block),
+        };
+
+        debug!("found bloc_loop: {:#?}", bloc_loop);
+        Ok((rem, bloc_loop))
+    }
+}
+
+#[derive(Serialize, Debug)]
 pub enum Type {
     Bool,
     I32,
@@ -777,7 +768,7 @@ impl Type {
         }
     }
 
-    pub fn parse<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&str, Type> {
+    pub fn parse<'a>(i: &'a str) -> IResult<&str, Type> {
         let (input, p_type) = basic::ident(i)?;
         let mut p_type = p_type.to_owned();
         p_type.retain(|c| !c.is_whitespace());
@@ -785,69 +776,75 @@ impl Type {
     }
 }
 
-mod basic {
+pub mod basic {
+    use super::E;
     use nom::{
         branch::alt,
         bytes::complete::{tag, take_while, take_while1},
         character::complete::{alpha1, alphanumeric1},
         combinator::recognize,
-        error::ParseError,
         multi::many0,
         sequence::{pair, tuple},
         IResult,
     };
 
-    pub fn ident<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn file_name<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+        recognize(tuple((ident, tag(".rsl"))))(i)
+    }
+
+    pub fn ident<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         recognize(pair(
             alt((alpha1, tag("_"))),
             many0(alt((alphanumeric1, tag("_")))),
         ))(i)
     }
 
-    pub fn comment<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub struct Comment(pub String);
+
+    pub fn comment<'a>(i: &'a str) -> IResult<&'a str, Comment, E> {
         let (input, (_, comment)) = tuple((tag("//"), take_while(|c| c != '\n')))(i)?;
-        Ok((input, comment))
+        Ok((input, Comment(comment.to_owned())))
     }
 
     const SEP_CHARS: &str = " \t\r\n";
 
-    pub fn sep1<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn sep1<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         take_while1(move |c| SEP_CHARS.contains(c))(i)
     }
 
-    pub fn sep<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn sep<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         take_while(move |c| SEP_CHARS.contains(c))(i)
     }
 
-    pub fn k_pub<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_pub<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("pub")(i)
     }
 
-    pub fn k_use<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_use<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("use")(i)
     }
 
-    pub fn k_struct<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_struct<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("struct")(i)
     }
 
-    pub fn k_fn<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_fn<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("fn")(i)
     }
 
-    pub fn k_if<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_if<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("if")(i)
     }
 
-    pub fn k_let<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_let<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("let")(i)
     }
 
-    pub fn k_for<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_for<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("for")(i)
     }
 
-    pub fn k_loop<'a, E: ParseError<&'a str>>(i: &'a str) -> IResult<&'a str, &'a str, E> {
+    pub fn k_loop<'a>(i: &'a str) -> IResult<&'a str, &'a str, E> {
         tag("loop")(i)
     }
 }
