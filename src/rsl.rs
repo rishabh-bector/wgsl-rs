@@ -106,6 +106,10 @@ impl SyntaxTree {
         ))
     }
 
+    pub fn pop_deps_self(&mut self) -> Vec<Dependency> {
+        Self::pop_deps(&mut self.nodes)
+    }
+
     // Drain all import statements from the tree.
     fn pop_deps(nodes: &mut Vec<Node>) -> Vec<Dependency> {
         let mut deps: Vec<Node> = vec![];

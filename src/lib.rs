@@ -86,8 +86,8 @@ impl CrateTree {
     pub fn link(mut self) {
         for (name, mut module) in self.modules {
             // merged module dependencies
-            let mut vert_deps = module.vert.pop_deps();
-            let mut frag_deps = module.frag.pop_deps();
+            let mut vert_deps = module.vert.pop_deps_self();
+            let mut frag_deps = module.frag.pop_deps_self();
             for i in 0..frag_deps.len() {
                 if vert_deps.contains(&frag_deps[i]) {
                     frag_deps.swap_remove(i);
