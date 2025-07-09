@@ -1,3 +1,5 @@
+> Note: this project is in an incomplete and abandoned state.
+
 # RSL: Rust Shader Language
 
 RSL is a shader language designed as an alternative to WGSL. It is intended for use with [wgpu-rs](https://github.com/gfx-rs/wgpu), an excellent implementation of the [WebGPU](https://gpuweb.github.io/gpuweb/) graphics API in Rust. The `wgpu` crate has become the standard for graphics developers using Rust. RSL is built on top of WGPU; it's intended to make WGSL more fun. If it's more efficient/reliable, that was an accident. But you never know...
